@@ -21,8 +21,8 @@ const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
 // Tunables
-const SILENCE_MS = 900;       // no media for this long => end of user turn
-const MIN_BUFFER_MS = 200;    // must have at least this much audio before commit
+const SILENCE_MS = 900; // no media for this long => end of user turn
+const MIN_BUFFER_MS = 200; // must have at least this much audio before commit
 
 const LOG_EVENT_TYPES = [
   'error',
@@ -74,9 +74,9 @@ wss.on('connection', (ws) => {
   let latestMediaTimestamp = 0;
 
   // Track a single utterance’s audio window using Twilio timestamps
-  let captureStartMs = null;       // timestamp of first media in the current user turn
-  let bufferedMs = 0;              // latestMediaTimestamp - captureStartMs
-  let awaitingResponse = false;    // we’ve asked OpenAI to reply; don’t double-commit
+  let captureStartMs = null; // timestamp of first media in the current user turn
+  let bufferedMs = 0; // latestMediaTimestamp - captureStartMs
+  let awaitingResponse = false; // true when a model response is pending
   let silenceTimer = null;
 
   // Assistant playback/markers
@@ -87,25 +87,31 @@ wss.on('connection', (ws) => {
   const resetSilenceTimer = () => {
     if (silenceTimer) clearTimeout(silenceTimer);
     silenceTimer = setTimeout(() => {
-      // Silence: only commit if we actually have enough audio buffered
-      bufferedMs = captureStartMs == null ? 0 : Math.max(0, latestMediaTimestamp - captureStartMs);
-      if (awaitingResponse) return;
-      if (bufferedMs < MIN_BUFFER_MS) {
-        console.log(`🧊 Silence but buffer too small (${bufferedMs}ms < ${MIN_BUFFER_MS}ms) — not committing`);
-        return;
-      }
-      console.log(`🛑 Silence detected (${bufferedMs}ms) → commit & request response`);
-      awaitingResponse = true;
-      openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      openAiWs.send(JSON.stringify({ type: 'response.create' }));
-      // reset capture window for the next turn
-      captureStartMs = null;
-      bufferedMs = 0;
+      requestResponse();
     }, SILENCE_MS);
   };
 
   const clearTurnState = () => {
     awaitingResponse = false;
+    captureStartMs = null;
+    bufferedMs = 0;
+  };
+
+  // --- fixed commit control ---
+  const requestResponse = () => {
+    if (awaitingResponse) {
+      console.log('⏸️ Already awaiting a response; skipping extra commit.');
+      return;
+    }
+    bufferedMs = captureStartMs == null ? 0 : Math.max(0, latestMediaTimestamp - captureStartMs);
+    if (bufferedMs < MIN_BUFFER_MS) {
+      console.log(`🧊 Not enough audio buffered (${bufferedMs}ms < ${MIN_BUFFER_MS}ms); skipping commit.`);
+      return;
+    }
+    awaitingResponse = true;
+    console.log(`🛑 Committing ${bufferedMs}ms of audio → requesting response`);
+    openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    openAiWs.send(JSON.stringify({ type: 'response.create' }));
     captureStartMs = null;
     bufferedMs = 0;
   };
@@ -127,7 +133,7 @@ wss.on('connection', (ws) => {
       session: {
         voice: VOICE,
         instructions: SYSTEM_MESSAGE,
-        modalities: ['audio', 'text'],   // ← required combo
+        modalities: ['audio', 'text'], // required combo
         input_audio_format: 'g711_ulaw', // Twilio μ-law in
         output_audio_format: 'g711_ulaw' // μ-law out to Twilio
       }
@@ -146,12 +152,14 @@ wss.on('connection', (ws) => {
     // If assistant was talking and user starts, truncate assistant
     if (markQueue.length > 0 && responseStartTimestampTwilio != null && lastAssistantItem) {
       const elapsed = Math.max(0, latestMediaTimestamp - responseStartTimestampTwilio);
-      openAiWs.send(JSON.stringify({
-        type: 'conversation.item.truncate',
-        item_id: lastAssistantItem,
-        content_index: 0,
-        audio_end_ms: elapsed
-      }));
+      openAiWs.send(
+        JSON.stringify({
+          type: 'conversation.item.truncate',
+          item_id: lastAssistantItem,
+          content_index: 0,
+          audio_end_ms: elapsed
+        })
+      );
       ws.send(JSON.stringify({ event: 'clear', streamSid }));
       markQueue = [];
       lastAssistantItem = null;
@@ -173,18 +181,22 @@ wss.on('connection', (ws) => {
       if (response.type === 'error') {
         console.error('❗ OpenAI ERROR:', JSON.stringify(response, null, 2));
       }
+
       if (LOG_EVENT_TYPES.includes(response.type)) {
         console.log(`OpenAI event: ${response.type}`);
       }
 
       if (response.type === 'response.output_audio.delta' && response.delta) {
-        // Assistant audio back to Twilio
-        awaitingResponse = false; // we are now speaking back
-        ws.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: response.delta }
-        }));
+        // when first delta arrives, mark ready for next turn
+        if (awaitingResponse) awaitingResponse = false;
+
+        ws.send(
+          JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: response.delta }
+          })
+        );
 
         if (responseStartTimestampTwilio == null) {
           responseStartTimestampTwilio = latestMediaTimestamp;
@@ -193,23 +205,18 @@ wss.on('connection', (ws) => {
         sendMark();
       }
 
+      if (response.type === 'response.done') {
+        awaitingResponse = false;
+        console.log('✅ Response finished; ready for next user turn.');
+      }
+
       if (response.type === 'input_audio_buffer.speech_started') {
         handleSpeechStartedEvent();
       }
 
       if (response.type === 'input_audio_buffer.speech_stopped') {
-        // Server VAD says stop; only commit if enough audio
-        bufferedMs = captureStartMs == null ? 0 : Math.max(0, latestMediaTimestamp - captureStartMs);
-        if (!awaitingResponse && bufferedMs >= MIN_BUFFER_MS) {
-          console.log(`🛑 VAD stop (${bufferedMs}ms) → commit & request response`);
-          awaitingResponse = true;
-          openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-          openAiWs.send(JSON.stringify({ type: 'response.create' }));
-          captureStartMs = null;
-          bufferedMs = 0;
-        } else {
-          console.log(`🧊 VAD stop but buffer too small (${bufferedMs}ms) — ignoring`);
-        }
+        console.log('🛑 Caller speech stopped (VAD)');
+        requestResponse();
       }
     } catch (err) {
       console.error('Error parsing OpenAI message:', err, 'Raw:', data?.toString?.());
@@ -233,7 +240,6 @@ wss.on('connection', (ws) => {
         case 'start':
           streamSid = data.start.streamSid;
           console.log('▶️ Stream started:', streamSid);
-          // start a fresh capture window
           clearTurnState();
           resetSilenceTimer();
           break;
@@ -241,20 +247,21 @@ wss.on('connection', (ws) => {
         case 'media': {
           latestMediaTimestamp = data.media.timestamp;
 
-          // Begin a new capture on first media of a turn
           if (captureStartMs == null) {
             captureStartMs = latestMediaTimestamp;
             bufferedMs = 0;
-            // console.log(`🎬 Capture start at ${captureStartMs}ms`);
           } else {
             bufferedMs = Math.max(0, latestMediaTimestamp - captureStartMs);
           }
 
           const audioPayload = data.media.payload;
           if (audioPayload && openAiWs.readyState === WebSocket.OPEN) {
-            // Append base64 μ-law frame
-            openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: audioPayload }));
-            console.log(`🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms (buffered ~${bufferedMs}ms)`);
+            openAiWs.send(
+              JSON.stringify({ type: 'input_audio_buffer.append', audio: audioPayload })
+            );
+            console.log(
+              `🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms (buffered ~${bufferedMs}ms)`
+            );
             resetSilenceTimer();
           }
           break;
@@ -267,14 +274,7 @@ wss.on('connection', (ws) => {
         case 'stop':
           console.log('⏹️ Stream stopped');
           if (silenceTimer) clearTimeout(silenceTimer);
-          // Final attempt to commit if we have enough audio
-          bufferedMs = captureStartMs == null ? 0 : Math.max(0, latestMediaTimestamp - captureStartMs);
-          if (!awaitingResponse && bufferedMs >= MIN_BUFFER_MS) {
-            console.log(`🛑 Stop with buffer ${bufferedMs}ms → commit & request response`);
-            awaitingResponse = true;
-            openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-            openAiWs.send(JSON.stringify({ type: 'response.create' }));
-          }
+          requestResponse();
           break;
 
         default:
@@ -288,7 +288,9 @@ wss.on('connection', (ws) => {
 
   ws.on('close', (code, reason) => {
     if (silenceTimer) clearTimeout(silenceTimer);
-    console.log(`❌ Twilio WS closed: code=${code} reason=${reason?.toString?.() || ''}`.trim());
+    console.log(
+      `❌ Twilio WS closed: code=${code} reason=${reason?.toString?.() || ''}`.trim()
+    );
     if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
   });
 
