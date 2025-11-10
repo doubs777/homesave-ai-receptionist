@@ -1,6 +1,6 @@
 {
   "name": "speech-assistant-openai-realtime-api-node",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Twilio + OpenAI Realtime voice assistant",
   "main": "index.js",
   "type": "module",
@@ -12,7 +12,6 @@
     "@fastify/websocket": "^11.0.0",
     "dotenv": "^16.4.5",
     "fastify": "^5.0.0",
-    "ws": "^8.18.0",
-    "ulaw-js": "^2.0.0"
+    "ws": "^8.18.0"
   }
 }
