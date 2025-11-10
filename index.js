@@ -48,17 +48,29 @@ fastify.get('/', async (request, reply) => {
 });
 
 // Route for Twilio to handle incoming calls
-// <Say> punctuation to improve text-to-speech translation
 fastify.all('/incoming-call', async (request, reply) => {
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-                          <Response>
-                              <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API</Say>
-                              <Pause length="1"/>
-                              <Say voice="Google.en-US-Chirp3-HD-Aoede">O.K. you can start talking!</Say>
-                              <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
-                              </Connect>
-                          </Response>`;
+  // Use the forwarded host (Render proxy) so the websocket URL resolves publicly
+  const host = request.headers['x-forwarded-host'] || request.headers.host;
+  const wsUrl = `wss://${host}/media-stream`;
+
+  const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Amy">
+    Please wait while I connect you to the assistant.
+  </Say>
+  <Pause length="1"/>
+  <Say voice="Polly.Amy">
+    Okay, you can start talking now.
+  </Say>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
+</Response>`;
+
+  // ✅ Send it back as proper TwiML (XML)
+  reply.code(200).type('text/xml').send(twimlResponse);
+});
+
 
     reply.type('text/xml').send(twimlResponse);
 });
@@ -127,9 +139,9 @@ fastify.register(async (fastify) => {
 
         // Handle interruption when the caller's speech starts
         const handleSpeechStartedEvent = () => {
-            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-                if (SHOW_TIMING_MATH) console.log(`Calculating elapsed time for truncation: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
+            if (markQueue.length > 0 && tartTimestampTwilio != null) {
+                const elapsedTime = latestMediaTimestamp - tartTimestampTwilio;
+                if (SHOW_TIMING_MATH) console.log(`Calculating elapsed time for truncation: ${latestMediaTimestamp} - ${tartTimestampTwilio} = ${elapsedTime}ms`);
 
                 if (lastAssistantItem) {
                     const truncateEvent = {
@@ -150,7 +162,7 @@ fastify.register(async (fastify) => {
                 // Reset
                 markQueue = [];
                 lastAssistantItem = null;
-                responseStartTimestampTwilio = null;
+                tartTimestampTwilio = null;
             }
         };
 
@@ -191,9 +203,9 @@ fastify.register(async (fastify) => {
                     connection.send(JSON.stringify(audioDelta));
 
                     // First delta from a new response starts the elapsed time counter
-                    if (!responseStartTimestampTwilio) {
-                        responseStartTimestampTwilio = latestMediaTimestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Setting start timestamp for new response: ${responseStartTimestampTwilio}ms`);
+                    if (!tartTimestampTwilio) {
+                        tartTimestampTwilio = latestMediaTimestamp;
+                        if (SHOW_TIMING_MATH) console.log(`Setting start timestamp for new response: ${tartTimestampTwilio}ms`);
                     }
 
                     if (response.item_id) {
