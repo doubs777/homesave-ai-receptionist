@@ -1,7 +1,6 @@
 {
-  "name": "speech-assistant-openai-realtime-api-node",
-  "version": "1.0.2",
-  "description": "Twilio + OpenAI Realtime voice assistant",
+  "name": "homesave-ai-receptionist",
+  "version": "1.0.0",
   "main": "index.js",
   "type": "module",
   "scripts": {
