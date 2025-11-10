@@ -20,7 +20,7 @@ fastify.register(fastifyWebsocket);
 
 // Config
 const SYSTEM_MESSAGE =
-  'You are a helpful and bubbly AI assistant who chats naturally. Collect the caller’s maintenance issue, flat number, and urgency; keep it concise and polite.';
+  'You are a helpful and friendly AI assistant for a property management company. Collect the caller’s maintenance issue, their flat number, and urgency; confirm their details clearly, and keep the conversation polite and natural.';
 const VOICE = 'alloy';
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
@@ -44,7 +44,7 @@ fastify.get('/', async (_req, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// ---- Twilio webhook: returns proper TwiML (XML) ----
+// ---- Twilio webhook: returns TwiML (XML) ----
 fastify.all('/incoming-call', async (request, reply) => {
   const host = request.headers['x-forwarded-host'] || request.headers.host;
   const wsUrl = `wss://${host}/media-stream`;
@@ -152,6 +152,7 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
   openAiWs.on('open', () => {
     console.log('✅ Connected to OpenAI Realtime API');
     setTimeout(initializeSession, 100);
+    setTimeout(() => console.log('🧠 Session initialised, awaiting audio...'), 300);
   });
 
   openAiWs.on('message', (data) => {
@@ -189,8 +190,8 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
       // ✅ NEW: when VAD says caller stopped, commit buffer and request a reply
       if (response.type === 'input_audio_buffer.speech_stopped') {
         console.log('🛑 Caller speech stopped → committing & requesting response');
-        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); // ✅ NEW
-        openAiWs.send(JSON.stringify({ type: 'response.create' }));           // ✅ NEW
+        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); // ✅ commit
+        openAiWs.send(JSON.stringify({ type: 'response.create' }));           // ✅ ask for reply
       }
 
       if (response.type === 'input_audio_buffer.speech_started') {
@@ -210,16 +211,21 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
       const data = JSON.parse(message);
 
       switch (data.event) {
-        case 'media':
+        case 'media': {
           latestMediaTimestamp = data.media.timestamp;
-          if (openAiWs.readyState === WebSocket.OPEN) {
+          const audioPayload = data.media.payload;
+
+          // ✅ Added audio debug and confirmation
+          if (audioPayload && openAiWs.readyState === WebSocket.OPEN) {
             const audioAppend = {
               type: 'input_audio_buffer.append',
-              audio: data.media.payload
+              audio: audioPayload
             };
             openAiWs.send(JSON.stringify(audioAppend));
+            console.log(`🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms`);
           }
           break;
+        }
 
         case 'start':
           streamSid = data.start.streamSid;
@@ -228,7 +234,7 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
           responseStartTimestampTwilio = null;
           latestMediaTimestamp = 0;
 
-          // ✅ Optional: have assistant greet first after connect
+          // Optional: have assistant greet first
           // setTimeout(() => {
           //   if (openAiWs.readyState === WebSocket.OPEN) {
           //     openAiWs.send(JSON.stringify({ type: 'response.create' }));
@@ -241,7 +247,6 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
           break;
 
         default:
-          // e.g., "stop", others
           console.log('Twilio WS event:', data.event);
           break;
       }
