@@ -20,7 +20,7 @@ const VOICE = 'alloy';
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
-const SILENCE_MS = 900; // slight bump for VAD stability
+const SILENCE_MS = 900; // Wait time before detecting silence → trigger response
 
 const LOG_EVENT_TYPES = [
   'error',
@@ -34,10 +34,12 @@ const LOG_EVENT_TYPES = [
   'session.updated'
 ];
 
+// Health route
 fastify.get('/', async (_req, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
+// Twilio webhook route (responds with TwiML)
 fastify.all('/incoming-call', async (request, reply) => {
   const host = request.headers['x-forwarded-host'] || request.headers.host;
   const wsUrl = `wss://${host}/media-stream`;
@@ -53,13 +55,14 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.code(200).type('text/xml').send(twimlResponse);
 });
 
+// Start Fastify server
 await fastify.listen({ port: PORT, host: '0.0.0.0' });
 console.log(`Server is listening on 0.0.0.0:${PORT}`);
 
+// WebSocket server for Twilio Media Streams
 const wss = new WebSocketServer({
   server: fastify.server,
-  path: '/media-stream',
-  handleProtocols: (protocols) => (protocols?.includes('audio') ? 'audio' : false)
+  path: '/media-stream'
 });
 
 wss.on('connection', (ws) => {
@@ -70,13 +73,13 @@ wss.on('connection', (ws) => {
   let lastAssistantItem = null;
   let markQueue = [];
   let responseStartTimestampTwilio = null;
-
   let silenceTimer = null;
   let awaitingResponse = false;
 
-  // ✅ Use a valid realtime model + required beta header
+  // Connect to OpenAI Realtime API
   const openAiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17&temperature=' + TEMPERATURE,
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17&temperature=' +
+      TEMPERATURE,
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -99,13 +102,13 @@ wss.on('connection', (ws) => {
   };
 
   const initializeSession = () => {
-    // ✅ Tell OpenAI we are using G.711 μ-law both directions
     const sessionUpdate = {
       type: 'session.update',
       session: {
         voice: VOICE,
         instructions: SYSTEM_MESSAGE,
-        modalities: ['audio'],
+        // ✅ Must include both audio + text modalities
+        modalities: ['audio', 'text'],
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw'
       }
@@ -118,12 +121,14 @@ wss.on('connection', (ws) => {
     if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
       const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
       if (lastAssistantItem) {
-        openAiWs.send(JSON.stringify({
-          type: 'conversation.item.truncate',
-          item_id: lastAssistantItem,
-          content_index: 0,
-          audio_end_ms: elapsedTime
-        }));
+        openAiWs.send(
+          JSON.stringify({
+            type: 'conversation.item.truncate',
+            item_id: lastAssistantItem,
+            content_index: 0,
+            audio_end_ms: elapsedTime
+          })
+        );
       }
       ws.send(JSON.stringify({ event: 'clear', streamSid }));
       markQueue = [];
@@ -149,7 +154,6 @@ wss.on('connection', (ws) => {
     try {
       const response = JSON.parse(data);
 
-      // ✅ Log full error details
       if (response.type === 'error') {
         console.error('❗ OpenAI ERROR:', JSON.stringify(response, null, 2));
       }
@@ -160,11 +164,13 @@ wss.on('connection', (ws) => {
 
       if (response.type === 'response.output_audio.delta' && response.delta) {
         awaitingResponse = false;
-        ws.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: response.delta }
-        }));
+        ws.send(
+          JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: response.delta }
+          })
+        );
 
         if (responseStartTimestampTwilio == null) {
           responseStartTimestampTwilio = latestMediaTimestamp;
@@ -209,9 +215,13 @@ wss.on('connection', (ws) => {
           latestMediaTimestamp = data.media.timestamp;
           const audioPayload = data.media.payload;
           if (audioPayload && openAiWs.readyState === WebSocket.OPEN) {
-            // Forward base64 μ-law directly; format is declared in session.update
-            openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: audioPayload }));
-            console.log(`🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms`);
+            // Forward base64 μ-law directly
+            openAiWs.send(
+              JSON.stringify({ type: 'input_audio_buffer.append', audio: audioPayload })
+            );
+            console.log(
+              `🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms`
+            );
             resetSilenceTimer();
           }
           break;
@@ -238,7 +248,9 @@ wss.on('connection', (ws) => {
 
   ws.on('close', (code, reason) => {
     if (silenceTimer) clearTimeout(silenceTimer);
-    console.log(`❌ Twilio WS closed: code=${code} reason=${reason?.toString?.() || ''}`.trim());
+    console.log(
+      `❌ Twilio WS closed: code=${code} reason=${reason?.toString?.() || ''}`.trim()
+    );
     if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
   });
 
