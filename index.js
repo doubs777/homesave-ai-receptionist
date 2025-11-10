@@ -20,31 +20,28 @@ const VOICE = 'alloy';
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
-// Tunables
-const SILENCE_MS = 900; // no media for this long => end of user turn
-const MIN_BUFFER_MS = 200; // must have at least this much audio before commit
+const SILENCE_MS = 900;
+const MIN_BUFFER_MS = 250; // must have at least 0.25s before commit
+const COMMIT_DELAY_MS = 150; // wait after last chunk before commit
 
 const LOG_EVENT_TYPES = [
   'error',
   'response.content.done',
-  'rate_limits.updated',
   'response.done',
-  'input_audio_buffer.committed',
-  'input_audio_buffer.speech_stopped',
   'input_audio_buffer.speech_started',
+  'input_audio_buffer.speech_stopped',
   'session.created',
   'session.updated'
 ];
 
-// Health
 fastify.get('/', async (_req, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// Twilio webhook → TwiML
 fastify.all('/incoming-call', async (request, reply) => {
   const host = request.headers['x-forwarded-host'] || request.headers.host;
   const wsUrl = `wss://${host}/media-stream`;
+
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Amy">Please wait while I connect you to the assistant.</Say>
@@ -54,35 +51,27 @@ fastify.all('/incoming-call', async (request, reply) => {
     <Stream url="${wsUrl}" />
   </Connect>
 </Response>`;
+
   reply.code(200).type('text/xml').send(twimlResponse);
 });
 
-// Start HTTP first; then raw WS for Twilio
 await fastify.listen({ port: PORT, host: '0.0.0.0' });
 console.log(`Server is listening on 0.0.0.0:${PORT}`);
 
-const wss = new WebSocketServer({
-  server: fastify.server,
-  path: '/media-stream'
-});
+const wss = new WebSocketServer({ server: fastify.server, path: '/media-stream' });
 
 wss.on('connection', (ws) => {
   console.log('🔌 Twilio connected to /media-stream');
 
-  // Per-call state
   let streamSid = null;
   let latestMediaTimestamp = 0;
-
-  // Track a single utterance’s audio window using Twilio timestamps
-  let captureStartMs = null; // timestamp of first media in the current user turn
-  let bufferedMs = 0; // latestMediaTimestamp - captureStartMs
-  let awaitingResponse = false; // true when a model response is pending
-  let silenceTimer = null;
-
-  // Assistant playback/markers
+  let captureStartMs = null;
+  let bufferedMs = 0;
+  let awaitingResponse = false;
   let lastAssistantItem = null;
   let responseStartTimestampTwilio = null;
   let markQueue = [];
+  let silenceTimer = null;
 
   const resetSilenceTimer = () => {
     if (silenceTimer) clearTimeout(silenceTimer);
@@ -92,33 +81,35 @@ wss.on('connection', (ws) => {
   };
 
   const clearTurnState = () => {
-    awaitingResponse = false;
     captureStartMs = null;
     bufferedMs = 0;
   };
 
-  // --- fixed commit control ---
   const requestResponse = () => {
     if (awaitingResponse) {
-      console.log('⏸️ Already awaiting a response; skipping extra commit.');
+      console.log('⏸️ Already awaiting response, skipping.');
       return;
     }
     bufferedMs = captureStartMs == null ? 0 : Math.max(0, latestMediaTimestamp - captureStartMs);
     if (bufferedMs < MIN_BUFFER_MS) {
-      console.log(`🧊 Not enough audio buffered (${bufferedMs}ms < ${MIN_BUFFER_MS}ms); skipping commit.`);
+      console.log(`🧊 Not enough audio buffered (${bufferedMs}ms < ${MIN_BUFFER_MS}ms).`);
       return;
     }
+
     awaitingResponse = true;
-    console.log(`🛑 Committing ${bufferedMs}ms of audio → requesting response`);
-    openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-    openAiWs.send(JSON.stringify({ type: 'response.create' }));
-    captureStartMs = null;
-    bufferedMs = 0;
+    console.log(`🛑 Preparing to commit ${bufferedMs}ms of audio...`);
+
+    setTimeout(() => {
+      console.log('📨 Committing buffer to OpenAI...');
+      openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      openAiWs.send(JSON.stringify({ type: 'response.create' }));
+      clearTurnState();
+    }, COMMIT_DELAY_MS);
   };
 
-  // Connect to OpenAI Realtime
   const openAiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17&temperature=' + TEMPERATURE,
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17&temperature=' +
+      TEMPERATURE,
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -133,12 +124,11 @@ wss.on('connection', (ws) => {
       session: {
         voice: VOICE,
         instructions: SYSTEM_MESSAGE,
-        modalities: ['audio', 'text'], // required combo
-        input_audio_format: 'g711_ulaw', // Twilio μ-law in
-        output_audio_format: 'g711_ulaw' // μ-law out to Twilio
+        modalities: ['audio', 'text'],
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw'
       }
     };
-    console.log('→ OpenAI session.update', sessionUpdate);
     openAiWs.send(JSON.stringify(sessionUpdate));
   };
 
@@ -148,36 +138,15 @@ wss.on('connection', (ws) => {
     markQueue.push('responsePart');
   };
 
-  const handleSpeechStartedEvent = () => {
-    // If assistant was talking and user starts, truncate assistant
-    if (markQueue.length > 0 && responseStartTimestampTwilio != null && lastAssistantItem) {
-      const elapsed = Math.max(0, latestMediaTimestamp - responseStartTimestampTwilio);
-      openAiWs.send(
-        JSON.stringify({
-          type: 'conversation.item.truncate',
-          item_id: lastAssistantItem,
-          content_index: 0,
-          audio_end_ms: elapsed
-        })
-      );
-      ws.send(JSON.stringify({ event: 'clear', streamSid }));
-      markQueue = [];
-      lastAssistantItem = null;
-      responseStartTimestampTwilio = null;
-    }
-  };
-
-  // OpenAI events
   openAiWs.on('open', () => {
     console.log('✅ Connected to OpenAI Realtime API');
-    setTimeout(initializeSession, 100);
-    setTimeout(() => console.log('🧠 Session initialised, awaiting audio...'), 300);
+    setTimeout(initializeSession, 150);
+    setTimeout(() => console.log('🧠 Session initialised, awaiting audio...'), 400);
   });
 
   openAiWs.on('message', (data) => {
     try {
       const response = JSON.parse(data);
-
       if (response.type === 'error') {
         console.error('❗ OpenAI ERROR:', JSON.stringify(response, null, 2));
       }
@@ -187,9 +156,7 @@ wss.on('connection', (ws) => {
       }
 
       if (response.type === 'response.output_audio.delta' && response.delta) {
-        // when first delta arrives, mark ready for next turn
-        if (awaitingResponse) awaitingResponse = false;
-
+        awaitingResponse = false;
         ws.send(
           JSON.stringify({
             event: 'media',
@@ -197,25 +164,17 @@ wss.on('connection', (ws) => {
             media: { payload: response.delta }
           })
         );
-
-        if (responseStartTimestampTwilio == null) {
-          responseStartTimestampTwilio = latestMediaTimestamp;
-        }
         if (response.item_id) lastAssistantItem = response.item_id;
         sendMark();
       }
 
       if (response.type === 'response.done') {
         awaitingResponse = false;
-        console.log('✅ Response finished; ready for next user turn.');
-      }
-
-      if (response.type === 'input_audio_buffer.speech_started') {
-        handleSpeechStartedEvent();
+        console.log('✅ Assistant finished speaking.');
       }
 
       if (response.type === 'input_audio_buffer.speech_stopped') {
-        console.log('🛑 Caller speech stopped (VAD)');
+        console.log('🛑 Caller speech stopped (VAD trigger)');
         requestResponse();
       }
     } catch (err) {
@@ -226,11 +185,9 @@ wss.on('connection', (ws) => {
   openAiWs.on('close', () => console.log('🔻 OpenAI WS closed'));
   openAiWs.on('error', (err) => console.error('OpenAI WS error:', err));
 
-  // Twilio frames
-  ws.on('message', (message, isBinary) => {
+  ws.on('message', (message) => {
     try {
-      const text = isBinary ? message.toString() : message.toString();
-      const data = JSON.parse(text);
+      const data = JSON.parse(message);
 
       switch (data.event) {
         case 'connected':
@@ -244,37 +201,20 @@ wss.on('connection', (ws) => {
           resetSilenceTimer();
           break;
 
-        case 'media': {
+        case 'media':
           latestMediaTimestamp = data.media.timestamp;
-
-          if (captureStartMs == null) {
-            captureStartMs = latestMediaTimestamp;
-            bufferedMs = 0;
-          } else {
-            bufferedMs = Math.max(0, latestMediaTimestamp - captureStartMs);
-          }
-
-          const audioPayload = data.media.payload;
-          if (audioPayload && openAiWs.readyState === WebSocket.OPEN) {
+          if (captureStartMs == null) captureStartMs = latestMediaTimestamp;
+          bufferedMs = latestMediaTimestamp - captureStartMs;
+          if (openAiWs.readyState === WebSocket.OPEN) {
             openAiWs.send(
-              JSON.stringify({ type: 'input_audio_buffer.append', audio: audioPayload })
+              JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload })
             );
-            console.log(
-              `🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms (buffered ~${bufferedMs}ms)`
-            );
-            resetSilenceTimer();
           }
+          resetSilenceTimer();
           break;
-        }
 
         case 'mark':
           if (markQueue.length > 0) markQueue.shift();
-          break;
-
-        case 'stop':
-          console.log('⏹️ Stream stopped');
-          if (silenceTimer) clearTimeout(silenceTimer);
-          requestResponse();
           break;
 
         default:
@@ -282,19 +222,12 @@ wss.on('connection', (ws) => {
           break;
       }
     } catch (err) {
-      console.error('Error parsing Twilio WS message:', err, 'Message:', message?.toString?.());
+      console.error('Error parsing Twilio WS message:', err, message?.toString?.());
     }
   });
 
-  ws.on('close', (code, reason) => {
-    if (silenceTimer) clearTimeout(silenceTimer);
-    console.log(
-      `❌ Twilio WS closed: code=${code} reason=${reason?.toString?.() || ''}`.trim()
-    );
+  ws.on('close', () => {
+    console.log('❌ Twilio WS closed');
     if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-  });
-
-  ws.on('error', (err) => {
-    console.error('❌ Twilio WS error:', err);
   });
 });
