@@ -20,8 +20,7 @@ const VOICE = 'alloy';
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
-// Timing
-const SILENCE_MS = 750; // no frames for this long = treat as end of speech
+const SILENCE_MS = 900; // slight bump for VAD stability
 
 const LOG_EVENT_TYPES = [
   'error',
@@ -54,17 +53,13 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.code(200).type('text/xml').send(twimlResponse);
 });
 
-// Start HTTP first; then attach raw WS with subprotocol "audio"
 await fastify.listen({ port: PORT, host: '0.0.0.0' });
 console.log(`Server is listening on 0.0.0.0:${PORT}`);
 
 const wss = new WebSocketServer({
   server: fastify.server,
   path: '/media-stream',
-  handleProtocols: (protocols) => {
-    if (Array.isArray(protocols) && protocols.includes('audio')) return 'audio';
-    return false;
-  }
+  handleProtocols: (protocols) => (protocols?.includes('audio') ? 'audio' : false)
 });
 
 wss.on('connection', (ws) => {
@@ -76,13 +71,18 @@ wss.on('connection', (ws) => {
   let markQueue = [];
   let responseStartTimestampTwilio = null;
 
-  // NEW: silence detector state
   let silenceTimer = null;
   let awaitingResponse = false;
 
+  // ✅ Use a valid realtime model + required beta header
   const openAiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17&temperature=' + TEMPERATURE,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
+    }
   );
 
   const requestResponse = () => {
@@ -99,20 +99,18 @@ wss.on('connection', (ws) => {
   };
 
   const initializeSession = () => {
+    // ✅ Tell OpenAI we are using G.711 μ-law both directions
     const sessionUpdate = {
       type: 'session.update',
       session: {
-        type: 'realtime',
-        model: 'gpt-realtime',
-        output_modalities: ['audio'],
-        audio: {
-          input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad' } },
-          output: { format: { type: 'audio/pcmu' }, voice: VOICE }
-        },
-        instructions: SYSTEM_MESSAGE
+        voice: VOICE,
+        instructions: SYSTEM_MESSAGE,
+        modalities: ['audio'],
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw'
       }
     };
-    console.log('→ OpenAI session.update');
+    console.log('→ OpenAI session.update', sessionUpdate);
     openAiWs.send(JSON.stringify(sessionUpdate));
   };
 
@@ -150,12 +148,18 @@ wss.on('connection', (ws) => {
   openAiWs.on('message', (data) => {
     try {
       const response = JSON.parse(data);
-      if (LOG_EVENT_TYPES.includes(response.type)) console.log(`OpenAI event: ${response.type}`);
+
+      // ✅ Log full error details
+      if (response.type === 'error') {
+        console.error('❗ OpenAI ERROR:', JSON.stringify(response, null, 2));
+      }
+
+      if (LOG_EVENT_TYPES.includes(response.type)) {
+        console.log(`OpenAI event: ${response.type}`);
+      }
 
       if (response.type === 'response.output_audio.delta' && response.delta) {
-        // got assistant audio → no longer awaiting
         awaitingResponse = false;
-
         ws.send(JSON.stringify({
           event: 'media',
           streamSid,
@@ -198,17 +202,17 @@ wss.on('connection', (ws) => {
           responseStartTimestampTwilio = null;
           latestMediaTimestamp = 0;
           awaitingResponse = false;
-          resetSilenceTimer(); // start listening for pauses
+          resetSilenceTimer();
           break;
 
         case 'media': {
           latestMediaTimestamp = data.media.timestamp;
           const audioPayload = data.media.payload;
           if (audioPayload && openAiWs.readyState === WebSocket.OPEN) {
+            // Forward base64 μ-law directly; format is declared in session.update
             openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: audioPayload }));
-            // prove audio flowing
             console.log(`🎤 Received audio chunk (${audioPayload.length} bytes) at ${latestMediaTimestamp}ms`);
-            resetSilenceTimer(); // each chunk resets the timer
+            resetSilenceTimer();
           }
           break;
         }
@@ -220,7 +224,6 @@ wss.on('connection', (ws) => {
         case 'stop':
           console.log('⏹️ Stream stopped');
           if (silenceTimer) clearTimeout(silenceTimer);
-          // ask for any pending reply on stop
           requestResponse();
           break;
 
