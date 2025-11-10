@@ -186,6 +186,13 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
         sendMark();
       }
 
+      // ✅ NEW: when VAD says caller stopped, commit buffer and request a reply
+      if (response.type === 'input_audio_buffer.speech_stopped') {
+        console.log('🛑 Caller speech stopped → committing & requesting response');
+        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); // ✅ NEW
+        openAiWs.send(JSON.stringify({ type: 'response.create' }));           // ✅ NEW
+      }
+
       if (response.type === 'input_audio_buffer.speech_started') {
         handleSpeechStartedEvent();
       }
@@ -220,6 +227,13 @@ fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
           // Reset timing for new stream
           responseStartTimestampTwilio = null;
           latestMediaTimestamp = 0;
+
+          // ✅ Optional: have assistant greet first after connect
+          // setTimeout(() => {
+          //   if (openAiWs.readyState === WebSocket.OPEN) {
+          //     openAiWs.send(JSON.stringify({ type: 'response.create' }));
+          //   }
+          // }, 300);
           break;
 
         case 'mark':
